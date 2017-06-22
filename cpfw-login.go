@@ -13,6 +13,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+	"github.com/keybase/go-keychain"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 const (
@@ -159,37 +161,70 @@ func run(client *http.Client, uri, user, password, check string) error {
 }
 
 func main() {
-	var uri string
+	var url string
 	var user string
 	var password string
 	var checkUrl string
 	var interval uint
 	var insecure bool
-	flag.StringVar(&uri, "url", os.Getenv("CPFW_AUTH_URL"), "login form base url, also: CPFW_AUTH_URL")
+	var osx_save_password bool
+	var prompt_password bool
+	flag.StringVar(&url, "url", os.Getenv("CPFW_AUTH_URL"), "login form base url, also: CPFW_AUTH_URL")
 	flag.StringVar(&user, "user", os.Getenv("CPFW_AUTH_USER"), "login username, also: CPFW_AUTH_USER")
 	flag.StringVar(&password, "password", os.Getenv("CPFW_AUTH_PASSWORD"), "login password, also: CPFW_AUTH_PASSWORD")
 	flag.StringVar(&checkUrl, "check", os.Getenv("CPFW_AUTH_CHECK_URL"), "check url for successful login, also: CPFW_AUTH_CHECK_URL")
 	flag.UintVar(&interval, "interval", 0, "recheck connection every Xs")
 	flag.BoolVar(&insecure, "insecure", false, "don't verify SSL/TLS connections")
+	flag.BoolVar(&osx_save_password, "osx-save-password", false, "save login password in keychain?")
+	flag.BoolVar(&prompt_password, "prompt-password", false, "read password from standard input")
 	flag.Parse()
 
-	if len(uri) == 0 {
-		log.Println("Missing mandatory parameter: uri")
+	if len(url) == 0 {
+		log.Println("Missing mandatory parameter: url")
 		os.Exit(1)
 	}
 	if len(user) == 0 {
 		log.Println("Missing mandatory parameter: user")
 		os.Exit(1)
 	}
-	if len(password) == 0 {
-		log.Println("Missing mandatory parameter: password")
-		os.Exit(1)
+	if prompt_password {
+		fmt.Print("Enter Password: ")
+		bytePassword, err := terminal.ReadPassword(0)
+		if err == nil {
+			password = string(bytePassword)
+			fmt.Println("\nPassword typed: " + string(bytePassword))
+		} else {
+			log.Printf("Unexpected error reading password!")
+			os.Exit(1)
+		}
 	}
-	log.Printf("Connecting to: %s", uri)
+	if len(password) == 0 {
+		query := keychain.NewItem()
+		query.SetSecClass(keychain.SecClassGenericPassword)
+		query.SetService(url)
+		query.SetAccount(user)
+		query.SetMatchLimit(keychain.MatchLimitOne)
+		query.SetReturnData(true)
+		results, err := keychain.QueryItem(query)
+		if err != nil || len(results) != 1 {
+			// Not found
+		} else {
+			log.Println("Using password from the keychain.")
+			password = string(results[0].Data)
+		}
 
-	client := httpClient(uri, user, insecure)
+		if err != nil || len(password) == 0 {
+			log.Println("No password saved in the keychain.")
+			log.Println("Missing mandatory parameter: password")
+			os.Exit(1)
+		}
+	}
+
+	log.Printf("Connecting to: %s", url)
+
+	client := httpClient(url, user, insecure)
 	for {
-		err := run(client, uri, user, password, checkUrl)
+		err := run(client, url, user, password, checkUrl)
 		if interval <= 0 {
 			// exit loop when not looping
 			if err != nil {
@@ -199,5 +234,33 @@ func main() {
 			break
 		}
 		time.Sleep(time.Duration(interval) * time.Second)
+	}
+	if (osx_save_password) {
+		log.Println("Saving password into keychain...")
+		item := keychain.NewItem()
+		item.SetSecClass(keychain.SecClassGenericPassword)
+		item.SetService(url)
+		item.SetAccount(user)
+		item.SetData([]byte(password))
+		item.SetSynchronizable(keychain.SynchronizableNo)
+		item.SetAccessible(keychain.AccessibleWhenUnlocked)
+
+		query := keychain.NewItem()
+		query.SetSecClass(keychain.SecClassGenericPassword)
+		query.SetService(url)
+		query.SetAccount(user)
+		query.SetMatchLimit(keychain.MatchLimitOne)
+		query.SetReturnData(true)
+
+		if keychain.AddItem(item) != nil {
+			log.Println("Error adding new password item in the keychain. Bug?")
+			os.Exit(1)
+		} else if keychain.AddItem(item) == keychain.ErrorDuplicateItem {
+			if keychain.UpdateItem(query, item) != nil {
+				log.Println("Error updating password in the keychain. Bug?")
+				os.Exit(1)
+			}
+		}
+		log.Println("Saved password in the keychain. You don't need --password flag anymore.")
 	}
 }
